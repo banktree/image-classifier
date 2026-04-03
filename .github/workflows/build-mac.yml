@@ -1,0 +1,52 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:   # 수동 실행 버튼
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli
+
+      - name: Build (Apple Silicon — arm64)
+        run: cargo tauri build --target aarch64-apple-darwin
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Build (Intel Mac — x86_64)
+        run: cargo tauri build --target x86_64-apple-darwin
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+
+      - name: Upload arm64 dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImageAutoClassifier-macOS-arm64
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+
+      - name: Upload x86_64 dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImageAutoClassifier-macOS-x86_64
+          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
