@@ -212,29 +212,35 @@ export default function App() {
     dedupGroupsRef.current = [];
     setDedupProgress({ current: 0, total: 0, filename: "" });
 
-    const unlisten = await listen<{ current: number; total: number; filename: string }>(
+    const unlistenProgress = await listen<{ current: number; total: number; filename: string }>(
       "dup-scan-progress",
       (event) => {
         const e = event.payload;
         setDedupProgress({ current: e.current, total: e.total, filename: e.filename });
       }
     );
-    dedupUnlistenRef.current = unlisten;
+
+    const unlistenGroup = await listen<DupGroup>("dup-group-found", (event) => {
+      const group = event.payload;
+      dedupGroupsRef.current = [...dedupGroupsRef.current, group];
+      setDedupGroups([...dedupGroupsRef.current]);
+    });
+
+    dedupUnlistenRef.current = () => { unlistenProgress(); unlistenGroup(); };
 
     try {
-      const groups = await invoke<DupGroup[]>("scan_duplicates", {
+      await invoke("scan_duplicates", {
         folderPath: dedupFolder,
         recursive: dedupRecursive,
         hashMethod: dedupHashMethod,
       });
-      dedupGroupsRef.current = groups;
-      setDedupGroups(groups);
       setDedupState("reviewing");
     } catch (err) {
       console.error(err);
       setDedupState("idle");
     } finally {
-      unlisten();
+      unlistenProgress();
+      unlistenGroup();
       dedupUnlistenRef.current = null;
     }
   }
@@ -868,7 +874,7 @@ export default function App() {
               )}
 
               {/* 결과 */}
-              {(dedupState === "reviewing" || dedupState === "applying") && (
+              {(dedupState === "scanning" || dedupState === "reviewing" || dedupState === "applying") && dedupGroups.length > 0 && (
                 <section className="review-section">
                   <div className="sticky-controls">
                     <div className="review-header">
@@ -917,9 +923,9 @@ export default function App() {
                   )}
 
                   <div className="review-actions">
-                    <button className="btn-cancel" onClick={resetDedup} disabled={dedupState === "applying"}>취소</button>
+                    <button className="btn-cancel" onClick={resetDedup} disabled={dedupState === "scanning" || dedupState === "applying"}>취소</button>
                     <button className="btn-apply" onClick={applyDedupMoves}
-                      disabled={dedupState === "applying" || !dedupDestFolder || dedupGroups.length === 0}>
+                      disabled={dedupState === "scanning" || dedupState === "applying" || !dedupDestFolder || dedupGroups.length === 0}>
                       {dedupState === "applying"
                         ? <><span className="spinner" /> 이동 중...</>
                         : `✅ 적용 (${dedupGroups.reduce((acc, g) => acc + g.images.length - 1, 0)}개 이동)`}

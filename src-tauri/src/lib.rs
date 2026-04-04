@@ -517,7 +517,7 @@ async fn scan_duplicates(
     recursive: bool,
     hash_method: String, // "exact" | "perceptual"
     dup_scan_state: State<'_, DupScanState>,
-) -> Result<Vec<DupGroup>, String> {
+) -> Result<(), String> {
     let folder = PathBuf::from(&folder_path);
     let images = collect_images_depth(&folder, recursive);
     let total = images.len();
@@ -541,7 +541,7 @@ async fn scan_duplicates(
     for (idx, path) in images.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
             *dup_scan_state.0.lock().await = None;
-            return Ok(vec![]);
+            return Ok(());
         }
 
         let filename = path
@@ -599,7 +599,7 @@ async fn scan_duplicates(
         }
         hash_map.into_values().filter(|g| g.len() >= 2).collect()
     } else {
-        let threshold = 10u32;
+        let threshold = 5u32;
         let mut edges: Vec<(usize, usize)> = Vec::new();
         for i in 0..scan_results.len() {
             for j in (i + 1)..scan_results.len() {
@@ -625,7 +625,12 @@ async fn scan_duplicates(
 
     // 중복 수 많은 그룹 먼저
     result.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
-    Ok(result)
+
+    // 그룹을 하나씩 이벤트로 emit (실시간 표시)
+    for group in result {
+        let _ = app.emit("dup-group-found", group);
+    }
+    Ok(())
 }
 
 #[tauri::command]
