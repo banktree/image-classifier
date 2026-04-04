@@ -2,6 +2,7 @@ use anyhow::Result;
 use base64::{engine::general_purpose, Engine};
 use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -80,6 +81,33 @@ impl ClassificationControl {
 
 // Tauri managed state: holds the current session's control handle.
 pub struct ControlState(pub Mutex<Option<Arc<ClassificationControl>>>);
+
+// ── Duplicate scan state ──────────────────────────────────────────────────────
+pub struct DupScanState(pub Mutex<Option<Arc<AtomicBool>>>);
+
+#[derive(Serialize, Clone)]
+struct DupScanProgress {
+    current: usize,
+    total: usize,
+    filename: String,
+}
+
+#[derive(Serialize, Clone)]
+struct DupImageInfo {
+    path: String,
+    filename: String,
+    size: u64,
+    width: u32,
+    height: u32,
+    thumbnail: String,
+}
+
+#[derive(Serialize, Clone)]
+struct DupGroup {
+    id: usize,
+    images: Vec<DupImageInfo>,
+    keep_idx: usize,
+}
 
 // ── Ollama ────────────────────────────────────────────────────────────────────
 
@@ -189,9 +217,14 @@ fn move_file_to_dir(src: &Path, dest_dir: &Path) -> Result<()> {
 }
 
 fn collect_images(folder: &Path) -> Vec<PathBuf> {
+    collect_images_depth(folder, false)
+}
+
+fn collect_images_depth(folder: &Path, recursive: bool) -> Vec<PathBuf> {
     let extensions = ["jpg", "jpeg", "png", "webp", "bmp", "gif"];
+    let max_depth = if recursive { usize::MAX } else { 1 };
     walkdir::WalkDir::new(folder)
-        .max_depth(1)
+        .max_depth(max_depth)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -204,6 +237,73 @@ fn collect_images(folder: &Path) -> Vec<PathBuf> {
         })
         .map(|e| e.path().to_path_buf())
         .collect()
+}
+
+fn compute_file_hash(path: &Path) -> Result<String> {
+    let data = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let result = hasher.finalize();
+    Ok(result.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// dHash (difference hash): 9×8 grayscale → 64-bit hash
+fn compute_dhash(img: &image::DynamicImage) -> u64 {
+    let small = img
+        .resize_exact(9, 8, FilterType::Lanczos3)
+        .grayscale();
+    let pixels = small.to_luma8().into_raw();
+    let mut hash: u64 = 0;
+    for row in 0..8usize {
+        for col in 0..8usize {
+            let left = pixels[row * 9 + col] as i32;
+            let right = pixels[row * 9 + col + 1] as i32;
+            if left > right {
+                hash |= 1u64 << (row * 8 + col);
+            }
+        }
+    }
+    hash
+}
+
+fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+fn find_root(parent: &mut Vec<usize>, mut x: usize) -> usize {
+    while parent[x] != x {
+        let px = parent[x];
+        parent[x] = parent[px];
+        x = parent[x];
+    }
+    x
+}
+
+fn group_by_edges(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..n).collect();
+    for &(a, b) in edges {
+        let ra = find_root(&mut parent, a);
+        let rb = find_root(&mut parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find_root(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+    groups.into_values().filter(|g| g.len() >= 2).collect()
+}
+
+/// 해상도×크기 기준으로 보존할 이미지 인덱스 결정
+fn determine_keeper(images: &[DupImageInfo]) -> usize {
+    images
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, img)| img.size + (img.width as u64 * img.height as u64) * 1000)
+        .map(|(i, _)| i)
+        .unwrap_or(0)
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -408,12 +508,156 @@ async fn apply_moves(
     Ok(())
 }
 
+// ── Duplicate detection commands ──────────────────────────────────────────────
+
+#[tauri::command]
+async fn scan_duplicates(
+    app: AppHandle,
+    folder_path: String,
+    recursive: bool,
+    hash_method: String, // "exact" | "perceptual"
+    dup_scan_state: State<'_, DupScanState>,
+) -> Result<Vec<DupGroup>, String> {
+    let folder = PathBuf::from(&folder_path);
+    let images = collect_images_depth(&folder, recursive);
+    let total = images.len();
+
+    if total == 0 {
+        return Err("선택한 폴더에 이미지가 없습니다.".to_string());
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    *dup_scan_state.0.lock().await = Some(cancelled.clone());
+
+    // Phase 1: 이미지별 메타데이터 + 썸네일 + 해시 수집
+    struct ScanItem {
+        info: DupImageInfo,
+        exact_hash: Option<String>,
+        dhash: Option<u64>,
+    }
+
+    let mut scan_results: Vec<ScanItem> = Vec::with_capacity(total);
+
+    for (idx, path) in images.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            *dup_scan_state.0.lock().await = None;
+            return Ok(vec![]);
+        }
+
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let _ = app.emit(
+            "dup-scan-progress",
+            DupScanProgress { current: idx + 1, total, filename: filename.clone() },
+        );
+
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let img_result = image::open(path);
+
+        let (width, height, thumbnail) = match &img_result {
+            Ok(img) => {
+                let w = img.width();
+                let h = img.height();
+                let thumb = img.thumbnail(120, 120);
+                let mut buf = Vec::new();
+                let _ = thumb.write_to(
+                    &mut std::io::Cursor::new(&mut buf),
+                    image::ImageFormat::Jpeg,
+                );
+                (w, h, general_purpose::STANDARD.encode(&buf))
+            }
+            Err(_) => (0, 0, String::new()),
+        };
+
+        let (exact_hash, dhash) = if hash_method == "exact" {
+            (compute_file_hash(path).ok(), None)
+        } else {
+            let dh = img_result.as_ref().ok().map(compute_dhash);
+            (None, dh)
+        };
+
+        scan_results.push(ScanItem {
+            info: DupImageInfo { path: path.to_string_lossy().to_string(), filename, size, width, height, thumbnail },
+            exact_hash,
+            dhash,
+        });
+    }
+
+    *dup_scan_state.0.lock().await = None;
+
+    // Phase 2: 중복 그룹 분류
+    let index_groups: Vec<Vec<usize>> = if hash_method == "exact" {
+        let mut hash_map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        for (i, item) in scan_results.iter().enumerate() {
+            if let Some(h) = &item.exact_hash {
+                hash_map.entry(h.clone()).or_default().push(i);
+            }
+        }
+        hash_map.into_values().filter(|g| g.len() >= 2).collect()
+    } else {
+        let threshold = 10u32;
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for i in 0..scan_results.len() {
+            for j in (i + 1)..scan_results.len() {
+                if let (Some(h1), Some(h2)) = (scan_results[i].dhash, scan_results[j].dhash) {
+                    if hamming_distance(h1, h2) <= threshold {
+                        edges.push((i, j));
+                    }
+                }
+            }
+        }
+        group_by_edges(scan_results.len(), &edges)
+    };
+
+    let mut result: Vec<DupGroup> = index_groups
+        .into_iter()
+        .enumerate()
+        .map(|(id, group_indices)| {
+            let group_images: Vec<DupImageInfo> = group_indices.iter().map(|&i| scan_results[i].info.clone()).collect();
+            let keep_idx = determine_keeper(&group_images);
+            DupGroup { id, images: group_images, keep_idx }
+        })
+        .collect();
+
+    // 중복 수 많은 그룹 먼저
+    result.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
+    Ok(result)
+}
+
+#[tauri::command]
+async fn cancel_dup_scan(dup_scan_state: State<'_, DupScanState>) -> Result<(), String> {
+    if let Some(c) = dup_scan_state.0.lock().await.as_ref() {
+        c.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn apply_duplicate_moves(
+    to_move: Vec<String>,
+    dest_folder: String,
+) -> Result<(), String> {
+    std::fs::create_dir_all(&dest_folder).map_err(|e| e.to_string())?;
+    for path_str in to_move {
+        let src = PathBuf::from(&path_str);
+        if src.exists() {
+            move_file_to_dir(&src, Path::new(&dest_folder)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 // ── App entry ─────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(ControlState(Mutex::new(None)))
+        .manage(DupScanState(Mutex::new(None)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -426,6 +670,9 @@ pub fn run() {
             resume_classification,
             cancel_classification,
             apply_moves,
+            scan_duplicates,
+            cancel_dup_scan,
+            apply_duplicate_moves,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
