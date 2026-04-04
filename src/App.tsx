@@ -36,6 +36,23 @@ interface DragState {
   currentY: number;
 }
 
+type DedupState = "idle" | "scanning" | "reviewing" | "applying" | "done";
+
+interface DupImage {
+  path: string;
+  filename: string;
+  size: number;
+  width: number;
+  height: number;
+  thumbnail: string;
+}
+
+interface DupGroup {
+  id: number;
+  images: DupImage[];
+  keep_idx: number;
+}
+
 type AppState = "idle" | "scanning" | "paused" | "reviewing" | "applying" | "done";
 
 export default function App() {
@@ -57,6 +74,19 @@ export default function App() {
   const [lastClickedIdx, setLastClickedIdx]   = useState<number | null>(null);
   const [dragState, setDragState]     = useState<DragState | null>(null);
   const [realtimeMode, setRealtimeMode] = useState(false);
+
+  // ── Dedup state ──────────────────────────────────────────────────────────
+  const [activeTab, setActiveTab] = useState<"classify" | "dedup">("classify");
+  const [dedupFolder, setDedupFolder] = useState("");
+  const [dedupDestFolder, setDedupDestFolder] = useState("");
+  const [dedupRecursive, setDedupRecursive] = useState(false);
+  const [dedupHashMethod, setDedupHashMethod] = useState<"exact" | "perceptual">("exact");
+  const [dedupState, setDedupState] = useState<DedupState>("idle");
+  const [dedupGroups, setDedupGroups] = useState<DupGroup[]>([]);
+  const [dedupProgress, setDedupProgress] = useState({ current: 0, total: 0, filename: "" });
+  const dedupGroupsRef = useRef<DupGroup[]>([]);
+  const dedupUnlistenRef = useRef<(() => void) | null>(null);
+
   const [showWelcome, setShowWelcome]   = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(false);
 
@@ -69,7 +99,7 @@ export default function App() {
   useEffect(() => { init(); }, []);
 
   // 폴더 경로 변경 시 자동 저장 (store 초기화 후에만)
-  useEffect(() => { savePaths(); }, [folderPath, folder2d, folder3d, folderUnknown]);
+  useEffect(() => { savePaths(); }, [folderPath, folder2d, folder3d, folderUnknown, dedupFolder, dedupDestFolder]);
 
   async function init() {
     // 저장된 경로 불러오기
@@ -84,6 +114,10 @@ export default function App() {
       if (d2) setFolder2d(d2);
       if (d3) setFolder3d(d3);
       if (du) setFolderUnknown(du);
+      const dd  = await store.get<string>("dedupFolder")    ?? "";
+      const ddd = await store.get<string>("dedupDestFolder") ?? "";
+      if (dd)  setDedupFolder(dd);
+      if (ddd) setDedupDestFolder(ddd);
     } catch { /* store 초기화 실패 시 무시 */ }
 
     // 시작 안내 팝업 표시 여부 확인
@@ -118,6 +152,8 @@ export default function App() {
     await store.set("folder2d",      folder2d);
     await store.set("folder3d",      folder3d);
     await store.set("folderUnknown", folderUnknown);
+    await store.set("dedupFolder",    dedupFolder);
+    await store.set("dedupDestFolder", dedupDestFolder);
     await store.save();
   }
 
@@ -167,6 +203,87 @@ export default function App() {
       document.removeEventListener("mouseup", handleMouseUp);
     };
   }, [dragState]);
+
+  // ── Dedup ────────────────────────────────────────────────────────────────
+  async function startDedupScan() {
+    if (!dedupFolder) return;
+    setDedupState("scanning");
+    setDedupGroups([]);
+    dedupGroupsRef.current = [];
+    setDedupProgress({ current: 0, total: 0, filename: "" });
+
+    const unlisten = await listen<{ current: number; total: number; filename: string }>(
+      "dup-scan-progress",
+      (event) => {
+        const e = event.payload;
+        setDedupProgress({ current: e.current, total: e.total, filename: e.filename });
+      }
+    );
+    dedupUnlistenRef.current = unlisten;
+
+    try {
+      const groups = await invoke<DupGroup[]>("scan_duplicates", {
+        folderPath: dedupFolder,
+        recursive: dedupRecursive,
+        hashMethod: dedupHashMethod,
+      });
+      dedupGroupsRef.current = groups;
+      setDedupGroups(groups);
+      setDedupState("reviewing");
+    } catch (err) {
+      console.error(err);
+      setDedupState("idle");
+    } finally {
+      unlisten();
+      dedupUnlistenRef.current = null;
+    }
+  }
+
+  async function cancelDedupScan() {
+    dedupUnlistenRef.current?.();
+    dedupUnlistenRef.current = null;
+    await invoke("cancel_dup_scan");
+    setDedupState("idle");
+  }
+
+  async function applyDedupMoves() {
+    if (!dedupDestFolder) return;
+    setDedupState("applying");
+    try {
+      const toMove: string[] = [];
+      for (const group of dedupGroupsRef.current) {
+        group.images.forEach((img, i) => {
+          if (i !== group.keep_idx) toMove.push(img.path);
+        });
+      }
+      await invoke("apply_duplicate_moves", { toMove, destFolder: dedupDestFolder });
+      setDedupState("done");
+    } catch (err) {
+      console.error(err);
+      setDedupState("reviewing");
+    }
+  }
+
+  function resetDedup() {
+    setDedupState("idle");
+    setDedupGroups([]);
+    dedupGroupsRef.current = [];
+    setDedupProgress({ current: 0, total: 0, filename: "" });
+  }
+
+  function changeKeepIdx(groupId: number, newKeepIdx: number) {
+    const updated = dedupGroupsRef.current.map(g =>
+      g.id === groupId ? { ...g, keep_idx: newKeepIdx } : g
+    );
+    dedupGroupsRef.current = updated;
+    setDedupGroups([...updated]);
+  }
+
+  function formatBytes(bytes: number) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
 
   // ── Classification ────────────────────────────────────────────────────────
   async function pickFolder(setter: (p: string) => void) {
@@ -372,8 +489,24 @@ export default function App() {
         </div>
       </header>
 
-      {/* ── Done ── */}
-      {appState === "done" && (
+      {/* ── Tab bar ── */}
+      <div className="tab-bar">
+        <button
+          className={`tab-btn ${activeTab === "classify" ? "active" : ""}`}
+          onClick={() => setActiveTab("classify")}
+        >
+          🗂 이미지 분류
+        </button>
+        <button
+          className={`tab-btn ${activeTab === "dedup" ? "active" : ""}`}
+          onClick={() => setActiveTab("dedup")}
+        >
+          🔍 중복 이미지
+        </button>
+      </div>
+
+      {/* ── Classify tab ── */}
+      {activeTab === "classify" && appState === "done" && (
         <div className="done-screen">
           <div className="done-card">
             <div className="done-icon">✅</div>
@@ -389,7 +522,7 @@ export default function App() {
         </div>
       )}
 
-      {appState !== "done" && (
+      {activeTab === "classify" && appState !== "done" && (
         <main className="main">
           {/* ── Folder + Mode ── */}
           <section className="folder-section">
@@ -628,6 +761,173 @@ export default function App() {
                 </div>
               )}
             </section>
+          )}
+        </main>
+      )}
+
+      {/* ── Dedup tab ── */}
+      {activeTab === "dedup" && (
+        <main className="main">
+          {/* Done */}
+          {dedupState === "done" && (
+            <div className="done-screen">
+              <div className="done-card">
+                <div className="done-icon">✅</div>
+                <h2>중복 정리 완료!</h2>
+                <p className="done-desc">
+                  {dedupGroups.reduce((acc, g) => acc + g.images.length - 1, 0)}개의 중복 파일이 이동되었습니다.
+                </p>
+                <button className="btn-primary" onClick={resetDedup}>다시 검사하기</button>
+              </div>
+            </div>
+          )}
+
+          {dedupState !== "done" && (
+            <>
+              {/* 폴더 설정 */}
+              <section className="folder-section">
+                <div className="folder-grid">
+                  <span className="folder-label">검사 폴더</span>
+                  <button className="btn-secondary folder-btn"
+                    onClick={() => pickFolder(setDedupFolder)}
+                    disabled={dedupState === "scanning" || dedupState === "applying"}>
+                    📁 선택
+                  </button>
+                  <span className="folder-path">{dedupFolder || "중복을 검사할 폴더"}</span>
+
+                  <span className="folder-label dest-label">이동 폴더</span>
+                  <button className="btn-secondary folder-btn"
+                    onClick={() => pickFolder(setDedupDestFolder)}
+                    disabled={dedupState === "scanning" || dedupState === "applying"}>
+                    📁 선택
+                  </button>
+                  <span className="folder-path">{dedupDestFolder || "중복 파일을 보낼 폴더"}</span>
+                </div>
+
+                {/* 옵션 */}
+                <div className="dedup-options">
+                  <label className={`mode-toggle ${dedupRecursive ? "on" : ""}`}>
+                    <input type="checkbox" checked={dedupRecursive}
+                      onChange={e => setDedupRecursive(e.target.checked)}
+                      disabled={dedupState === "scanning"} />
+                    <span className="toggle-slider" />
+                    <span className="toggle-label">
+                      {dedupRecursive ? "📂 하위 폴더 포함" : "📁 선택 폴더만"}
+                    </span>
+                  </label>
+
+                  <div className="hash-method-row">
+                    <span className="hash-method-label">중복 기준</span>
+                    <label className={`hash-radio ${dedupHashMethod === "exact" ? "selected" : ""}`}>
+                      <input type="radio" name="hashMethod" value="exact"
+                        checked={dedupHashMethod === "exact"}
+                        onChange={() => setDedupHashMethod("exact")}
+                        disabled={dedupState === "scanning"} />
+                      파일 해시 (완전 동일)
+                    </label>
+                    <label className={`hash-radio ${dedupHashMethod === "perceptual" ? "selected" : ""}`}>
+                      <input type="radio" name="hashMethod" value="perceptual"
+                        checked={dedupHashMethod === "perceptual"}
+                        onChange={() => setDedupHashMethod("perceptual")}
+                        disabled={dedupState === "scanning"} />
+                      유사 이미지 (dHash)
+                    </label>
+                  </div>
+                </div>
+              </section>
+
+              {/* 진행 상태 */}
+              {dedupState === "scanning" && (
+                <section className="progress-section">
+                  <div className="progress-header">
+                    <span className="progress-label">중복 검사 중...</span>
+                    <span className="progress-count">{dedupProgress.current} / {dedupProgress.total}</span>
+                  </div>
+                  <div className="progress-bar-bg">
+                    <div className="progress-bar-fill"
+                      style={{ width: `${dedupProgress.total > 0 ? (dedupProgress.current / dedupProgress.total) * 100 : 0}%` }} />
+                  </div>
+                  <div className="progress-meta">
+                    <span className="progress-file">{dedupProgress.filename}</span>
+                  </div>
+                  <div className="action-section scanning-controls" style={{ marginTop: 8 }}>
+                    <button className="btn-cancel-scan" onClick={cancelDedupScan}>✕ 취소</button>
+                  </div>
+                </section>
+              )}
+
+              {/* 시작 버튼 */}
+              {dedupState === "idle" && (
+                <section className="action-section">
+                  <button className="btn-primary btn-start" onClick={startDedupScan}
+                    disabled={!dedupFolder}>
+                    🔍 중복 검사 시작
+                  </button>
+                  {!dedupFolder && <p className="start-hint">검사할 폴더를 선택해주세요</p>}
+                </section>
+              )}
+
+              {/* 결과 */}
+              {(dedupState === "reviewing" || dedupState === "applying") && (
+                <section className="review-section">
+                  <div className="sticky-controls">
+                    <div className="review-header">
+                      <h2>중복 검사 결과
+                        <span className="result-count">
+                          ({dedupGroups.length}개 그룹 ·&nbsp;
+                          {dedupGroups.reduce((acc, g) => acc + g.images.length - 1, 0)}개 삭제 대상)
+                        </span>
+                      </h2>
+                    </div>
+                  </div>
+
+                  {dedupGroups.length === 0 ? (
+                    <div className="dedup-empty">중복 이미지가 없습니다 🎉</div>
+                  ) : (
+                    dedupGroups.map(group => (
+                      <div key={group.id} className="dup-group">
+                        <div className="dup-group-header">
+                          그룹 {group.id + 1} — {group.images.length}개 중 1개 보존
+                        </div>
+                        <div className="dup-group-images">
+                          {group.images.map((img, i) => {
+                            const isKeeper = i === group.keep_idx;
+                            return (
+                              <div key={img.path}
+                                className={`dup-image-card ${isKeeper ? "keeper" : "to-delete"}`}
+                                onClick={() => dedupState === "reviewing" && changeKeepIdx(group.id, i)}>
+                                <div className="image-thumb-wrap">
+                                  {img.thumbnail
+                                    ? <img src={`data:image/jpeg;base64,${img.thumbnail}`} alt={img.filename} className="image-thumb" />
+                                    : <div className="image-thumb-placeholder">🖼</div>}
+                                  <span className={`dup-badge ${isKeeper ? "dup-keep" : "dup-del"}`}>
+                                    {isKeeper ? "✓ 유지" : "삭제"}
+                                  </span>
+                                </div>
+                                <div className="image-info">
+                                  <span className="image-name" title={img.filename}>{img.filename}</span>
+                                  <span className="dup-meta">{img.width}×{img.height} · {formatBytes(img.size)}</span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))
+                  )}
+
+                  <div className="review-actions">
+                    <button className="btn-cancel" onClick={resetDedup} disabled={dedupState === "applying"}>취소</button>
+                    <button className="btn-apply" onClick={applyDedupMoves}
+                      disabled={dedupState === "applying" || !dedupDestFolder || dedupGroups.length === 0}>
+                      {dedupState === "applying"
+                        ? <><span className="spinner" /> 이동 중...</>
+                        : `✅ 적용 (${dedupGroups.reduce((acc, g) => acc + g.images.length - 1, 0)}개 이동)`}
+                    </button>
+                  </div>
+                </section>
+              )}
+            </>
           )}
         </main>
       )}
