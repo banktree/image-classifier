@@ -529,14 +529,15 @@ async fn scan_duplicates(
     let cancelled = Arc::new(AtomicBool::new(false));
     *dup_scan_state.0.lock().await = Some(cancelled.clone());
 
-    // Phase 1: 이미지별 메타데이터 + 썸네일 + 해시 수집
-    struct ScanItem {
-        info: DupImageInfo,
+    // ── Phase 1: 해시값만 계산 (썸네일 없이 메모리 절약) ──────────────────
+    struct HashItem {
+        path: PathBuf,
+        size: u64,
         exact_hash: Option<String>,
         dhash: Option<u64>,
     }
 
-    let mut scan_results: Vec<ScanItem> = Vec::with_capacity(total);
+    let mut hash_items: Vec<HashItem> = Vec::with_capacity(total);
 
     for (idx, path) in images.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
@@ -544,55 +545,34 @@ async fn scan_duplicates(
             return Ok(());
         }
 
-        let filename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        let _ = app.emit(
-            "dup-scan-progress",
-            DupScanProgress { current: idx + 1, total, filename: filename.clone() },
-        );
+        let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let _ = app.emit("dup-scan-progress", DupScanProgress {
+            current: idx + 1,
+            total,
+            filename,
+        });
 
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let img_result = image::open(path);
-
-        let (width, height, thumbnail) = match &img_result {
-            Ok(img) => {
-                let w = img.width();
-                let h = img.height();
-                let thumb = img.thumbnail(120, 120);
-                let mut buf = Vec::new();
-                let _ = thumb.write_to(
-                    &mut std::io::Cursor::new(&mut buf),
-                    image::ImageFormat::Jpeg,
-                );
-                (w, h, general_purpose::STANDARD.encode(&buf))
-            }
-            Err(_) => (0, 0, String::new()),
-        };
 
         let (exact_hash, dhash) = if hash_method == "exact" {
             (compute_file_hash(path).ok(), None)
         } else {
-            let dh = img_result.as_ref().ok().map(compute_dhash);
+            let dh = image::open(path).ok().as_ref().map(compute_dhash);
             (None, dh)
         };
 
-        scan_results.push(ScanItem {
-            info: DupImageInfo { path: path.to_string_lossy().to_string(), filename, size, width, height, thumbnail },
-            exact_hash,
-            dhash,
-        });
+        hash_items.push(HashItem { path: path.clone(), size, exact_hash, dhash });
     }
 
-    *dup_scan_state.0.lock().await = None;
+    if cancelled.load(Ordering::Relaxed) {
+        *dup_scan_state.0.lock().await = None;
+        return Ok(());
+    }
 
-    // Phase 2: 중복 그룹 분류
-    let index_groups: Vec<Vec<usize>> = if hash_method == "exact" {
+    // ── Phase 2: 중복 그룹 인덱스 계산 ──────────────────────────────────────
+    let mut index_groups: Vec<Vec<usize>> = if hash_method == "exact" {
         let mut hash_map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-        for (i, item) in scan_results.iter().enumerate() {
+        for (i, item) in hash_items.iter().enumerate() {
             if let Some(h) = &item.exact_hash {
                 hash_map.entry(h.clone()).or_default().push(i);
             }
@@ -601,35 +581,54 @@ async fn scan_duplicates(
     } else {
         let threshold = 5u32;
         let mut edges: Vec<(usize, usize)> = Vec::new();
-        for i in 0..scan_results.len() {
-            for j in (i + 1)..scan_results.len() {
-                if let (Some(h1), Some(h2)) = (scan_results[i].dhash, scan_results[j].dhash) {
+        for i in 0..hash_items.len() {
+            for j in (i + 1)..hash_items.len() {
+                if let (Some(h1), Some(h2)) = (hash_items[i].dhash, hash_items[j].dhash) {
                     if hamming_distance(h1, h2) <= threshold {
                         edges.push((i, j));
                     }
                 }
             }
         }
-        group_by_edges(scan_results.len(), &edges)
+        group_by_edges(hash_items.len(), &edges)
     };
 
-    let mut result: Vec<DupGroup> = index_groups
-        .into_iter()
-        .enumerate()
-        .map(|(id, group_indices)| {
-            let group_images: Vec<DupImageInfo> = group_indices.iter().map(|&i| scan_results[i].info.clone()).collect();
-            let keep_idx = determine_keeper(&group_images);
-            DupGroup { id, images: group_images, keep_idx }
-        })
-        .collect();
-
     // 중복 수 많은 그룹 먼저
-    result.sort_by(|a, b| b.images.len().cmp(&a.images.len()));
+    index_groups.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    // 그룹을 하나씩 이벤트로 emit (실시간 표시)
-    for group in result {
-        let _ = app.emit("dup-group-found", group);
+    // ── Phase 3: 중복 이미지만 썸네일 로드 후 실시간 emit ────────────────────
+    for (id, group_indices) in index_groups.into_iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) { break; }
+
+        let mut group_images: Vec<DupImageInfo> = Vec::new();
+        for &i in &group_indices {
+            let path = &hash_items[i].path;
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let size = hash_items[i].size;
+
+            let (width, height, thumbnail) = match image::open(path) {
+                Ok(img) => {
+                    let w = img.width();
+                    let h = img.height();
+                    let thumb = img.thumbnail(120, 120);
+                    let mut buf = Vec::new();
+                    let _ = thumb.write_to(
+                        &mut std::io::Cursor::new(&mut buf),
+                        image::ImageFormat::Jpeg,
+                    );
+                    (w, h, general_purpose::STANDARD.encode(&buf))
+                }
+                Err(_) => (0, 0, String::new()),
+            };
+
+            group_images.push(DupImageInfo { path: path.to_string_lossy().to_string(), filename, size, width, height, thumbnail });
+        }
+
+        let keep_idx = determine_keeper(&group_images);
+        let _ = app.emit("dup-group-found", DupGroup { id, images: group_images, keep_idx });
     }
+
+    *dup_scan_state.0.lock().await = None;
     Ok(())
 }
 
